@@ -131,3 +131,82 @@ def call_gemini(prompt: str, max_output_tokens: int = 256, temperature: float = 
     except (KeyError, IndexError):
         text = json.dumps(data, indent=2)
     return text
+
+# A) Select an open-source pre-trained conversational language model of your choice (that you can take, e.g., from the Hugging Face Transformers library). 
+    # Implement a RAG pipeline to enhance responses with external knowledge or your choice. [10 points]
+
+# Cell-5
+
+embedder = SentenceTransformer(EMBED_MODEL)
+
+wiki_stream = load_dataset(
+    "wikimedia/wikipedia",
+    "20231101.en",
+    split="train",
+    streaming=True
+)
+
+MAX_ARTICLES = 500
+docs = []
+count = 0
+
+for item in wiki_stream:
+    if count >= MAX_ARTICLES:
+        break
+    title = item.get("title", f"doc_{count}")
+    text = item.get("text", "")
+    for j, para in enumerate(text.split("\n\n")):
+        para = para.strip()
+        if len(para) > 200:
+            docs.append({"id": f"{count}_{j}", "title": title, "text": para})
+    count += 1
+
+print("Prepared", len(docs), "paragraph-level documents for RAG.")
+
+# Cell-6
+
+texts = [d["text"] for d in docs]
+corpus_embeddings = embedder.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+embedding_dim = corpus_embeddings.shape[1]
+
+faiss.normalize_L2(corpus_embeddings)
+index = faiss.IndexFlatIP(embedding_dim)
+index.add(corpus_embeddings)
+
+print("FAISS index built with", index.ntotal, "vectors.")
+
+# Cell-7
+
+def retrieve(query: str, k: int = 5):
+    q_emb = embedder.encode([query], convert_to_numpy=True)
+    faiss.normalize_L2(q_emb)
+    scores, idxs = index.search(q_emb, k)
+    passages = [docs[int(idx)] for idx in idxs[0]]
+    return passages, scores[0]
+
+def build_prompt(query: str, passages: List[Dict[str, Any]]) -> str:
+    ctx = "\n\n".join([f"Source: {p['title']}\n{p['text']}" for p in passages])
+    return (
+        "You are a helpful assistant. Use the following context to answer the question. "
+        "Cite the source titles when relevant.\n\n"
+        f"Context:\n{ctx}\n\nQuestion: {query}\nAnswer:"
+    )
+
+def rag_answer_gemini(query: str, k: int = 5):
+    passages, scores = retrieve(query, k=k)
+    prompt = build_prompt(query, passages)
+    answer = call_gemini(prompt, max_output_tokens=300, temperature=0.0)
+    return {
+        "answer": answer,
+        "retrieved_titles": [p["title"] for p in passages],
+        "scores": scores.tolist(),
+    }
+
+# Cell-8
+
+res = rag_answer_gemini(
+    "What is an algorithm and why are algorithms important in computer science?",
+    k=5
+)
+print("Answer:\n", res["answer"])
+print("\nRetrieved titles:", res["retrieved_titles"])
