@@ -377,3 +377,127 @@ except NameError:
 
 accuracy = eval_subset(trained_model, test_tok, n=200)
 print(f"Accuracy on 200-sample subset: {accuracy:.4f}")
+
+# C) Develop and test a Model Context Protocol (MCP) Server in Python that bridges an AI client to an external data source or utility. 
+# You should test your server using an LLM of your choice (e.g., Google Gemini's free tier). 
+# You are free to choose any domain (e.g., weather, stocks, games), but your server must implement at least two distinct tools using public APIs (ideally free - no need to spend money on this) or local data. 
+# Submit your Python source code and a screenshot demonstrating the system successfully answering a prompt by executing your custom tools. [30 points]
+
+# Cell-15
+
+mcp_code = r"""
+from fastapi import FastAPI, HTTPException
+import random, requests
+
+app = FastAPI()
+
+@app.get("/tools")
+def list_tools():
+    return {"tools":[
+        {"name":"randomNumber","description":"Return random integer between min and max","inputs":{"min":"int","max":"int"}},
+        {"name":"weatherByCity","description":"Return current weather for a city using Open-Meteo","inputs":{"city":"string"}}
+    ]}
+
+@app.get("/tool/randomNumber")
+def random_number(min: int = 0, max: int = 10):
+    if min > max:
+        raise HTTPException(status_code=400, detail="min must be <= max")
+    return {"tool":"randomNumber","min":min,"max":max,"result":random.randint(min,max)}
+
+@app.get("/tool/weatherByCity")
+def weather_by_city(city: str):
+    city_map = {"london": (51.5074, -0.1278), "new york": (40.7128, -74.0060), "san francisco": (37.7749, -122.4194)}
+    key = city.lower()
+    if key not in city_map:
+        raise HTTPException(status_code=404, detail="City not in demo mapping")
+    lat, lon = city_map[key]
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Weather API error")
+    return {"tool":"weatherByCity","city":city,"result":resp.json().get("current_weather")}
+"""
+Path("mcp_server.py").write_text(mcp_code)
+print("Wrote mcp_server.py")
+
+# Cell-16
+
+import threading, subprocess, sys, time
+import nest_asyncio
+
+nest_asyncio.apply()
+
+BASE_URL = "http://127.0.0.1:8000"
+
+def run_server():
+    cmd = [
+        sys.executable,
+        "-m", "uvicorn",
+        "mcp_server:app",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--log-level", "info",
+    ]
+    subprocess.run(cmd)
+
+server_thread = threading.Thread(target=run_server, daemon=True)
+server_thread.start()
+
+time.sleep(2)
+print("Server started at:", BASE_URL)
+
+# Cell-17
+
+print("Tools:", requests.get(BASE_URL + "/tools").json())
+print("Random number:", requests.get(BASE_URL + "/tool/randomNumber?min=5&max=15").json())
+print("Weather London:", requests.get(BASE_URL + "/tool/weatherByCity?city=London").json())
+
+# Cell-18
+
+tool_prompt = f"""
+You are an agent that can call tools via HTTP.
+
+Tools:
+1) randomNumber(min:int, max:int)
+2) weatherByCity(city:string)
+
+Return STRICT JSON with a key "calls" whose value is a list of calls.
+Each call is {{"tool":"toolName","args":{{...}}}}.
+
+Example:
+{{
+  "calls": [
+    {{"tool":"weatherByCity","args":{{"city":"London"}}}},
+    {{"tool":"randomNumber","args":{{"min":1,"max":10}}}}
+  ]
+}}
+
+Task: Produce calls to get the current weather in London, then a random number between 1 and 10.
+Only output the JSON.
+"""
+
+llm_text = call_gemini(tool_prompt, max_output_tokens=300, temperature=0.0)
+print("Gemini raw output:\n", llm_text)
+
+m = re.search(r"\{.*\}", llm_text, flags=re.S)
+if not m:
+    raise RuntimeError("Could not find JSON in Gemini output; inspect raw output.")
+
+payload = json.loads(m.group(0))
+print("Parsed JSON payload:", payload)
+
+results = []
+for call in payload.get("calls", []):
+    tool = call["tool"]
+    args = call.get("args", {})
+
+    if tool == "weatherByCity":
+        r = requests.get(BASE_URL + f"/tool/weatherByCity?city={args['city']}").json()
+    elif tool == "randomNumber":
+        r = requests.get(BASE_URL + f"/tool/randomNumber?min={args['min']}&max={args['max']}").json()
+    else:
+        r = {"error": "unknown tool"}
+
+    results.append({"tool": tool, "args": args, "result": r})
+
+print("Tool execution results:\n", json.dumps(results, indent=2))
