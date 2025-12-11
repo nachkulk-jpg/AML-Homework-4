@@ -210,3 +210,170 @@ res = rag_answer_gemini(
 )
 print("Answer:\n", res["answer"])
 print("\nRetrieved titles:", res["retrieved_titles"])
+
+# B) Select an open-source pre-trained conversational language model of your choice (that you can take, e.g., from the Hugging Face Transformers library). 
+# Use a small domain-specific dataset to fine-tune the model (or use parameter-efficient fine-tuning methods like LoRA or QLoRA). [10 points]
+
+# Cell-9
+
+raw = load_dataset(CLASSIFICATION_DATASET)
+print("Original splits:", raw.keys())
+
+full = raw["train"].train_test_split(test_size=0.2, seed=42)
+train_raw = full["train"].shuffle(seed=42).select(range(2000))
+test_raw  = full["test"].shuffle(seed=42).select(range(500))
+
+print("New splits: train =", len(train_raw), ", test =", len(test_raw))
+print("Example row:", train_raw[0])
+
+# Cell-10
+
+tokenizer_cls = AutoTokenizer.from_pretrained(CLASSIFICATION_MODEL)
+
+print("Train columns:", train_raw.column_names)
+
+if "label" in train_raw.column_names:
+    LABEL_COL = "label"
+elif "class" in train_raw.column_names:
+    LABEL_COL = "class"
+else:
+    raise ValueError(f"Could not find a label column in {train_raw.column_names}")
+
+print("Using label column:", LABEL_COL)
+
+def preprocess(examples):
+    return tokenizer_cls(
+        examples["tweet"],
+        truncation=True,
+        padding="max_length",
+        max_length=128,
+    )
+
+train_tok = train_raw.map(preprocess, batched=True)
+test_tok  = test_raw.map(preprocess, batched=True)
+
+print("Tokenized train columns:", train_tok.column_names)
+
+# Cell-11
+
+num_labels = len(set(train_raw[LABEL_COL]))
+base_model = AutoModelForSequenceClassification.from_pretrained(
+    CLASSIFICATION_MODEL,
+    num_labels=num_labels,
+)
+
+lora_cfg = LoraConfig(
+    r=8,
+    lora_alpha=32,
+    target_modules=["q_lin", "k_lin", "v_lin"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="SEQ_CLS",
+)
+
+model_peft = get_peft_model(base_model, lora_cfg)
+
+trainable = sum(p.numel() for p in model_peft.parameters() if p.requires_grad)
+total = sum(p.numel() for p in model_peft.parameters())
+print(f"Trainable params: {trainable} / {total} ({100*trainable/total:.3f}%)")
+
+# Cell-12
+
+print("train_tok columns BEFORE rename:", train_tok.column_names)
+print("test_tok  columns BEFORE rename:", test_tok.column_names)
+
+if "labels" in train_tok.column_names:
+    effective_label_col = "labels"
+else:
+    if LABEL_COL not in train_tok.column_names:
+        raise ValueError(
+            f"Original label column {LABEL_COL!r} not in dataset. "
+            f"Current columns: {train_tok.column_names}"
+        )
+    train_tok = train_tok.rename_column(LABEL_COL, "labels")
+    test_tok  = test_tok.rename_column(LABEL_COL, "labels")
+    effective_label_col = "labels"
+
+print("Using label column:", effective_label_col)
+print("train_tok columns AFTER rename:", train_tok.column_names)
+print("test_tok  columns AFTER rename:", test_tok.column_names)
+
+train_tok.set_format(type="torch", columns=["input_ids", "attention_mask", effective_label_col])
+test_tok.set_format(type="torch",  columns=["input_ids", "attention_mask", effective_label_col])
+
+training_args = TrainingArguments(
+    output_dir="./distilbert_lora_output",
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=32,
+    num_train_epochs=2,
+    learning_rate=2e-4,
+    fp16=torch.cuda.is_available(),
+    logging_steps=50,
+    report_to="none"
+)
+
+trainer = Trainer(
+    model=model_peft,
+    args=training_args,
+    train_dataset=train_tok,
+    eval_dataset=test_tok,
+)
+
+print("Trainer ready. Next: run trainer.train() in Cell B5 when you're ready.")
+
+# Cell-13
+
+import os
+
+os.environ["WANDB_DISABLED"] = "true"
+os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_SILENT"] = "true"
+os.environ["WANDB_PROJECT"] = "ignore"
+os.environ["WANDB_START_METHOD"] = "thread"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+trainer.train()
+trainer.save_model("./distilbert_lora_output")
+
+# Cell-14
+
+from torch.utils.data import DataLoader
+import numpy as np
+import torch
+
+def eval_subset(model, dataset, n=200):
+    subset = dataset.select(range(min(n, len(dataset))))
+    loader = DataLoader(subset, batch_size=32)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    preds = []
+    labels = []
+
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            y_true = batch["labels"].cpu().numpy()
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits.cpu().numpy()
+            y_pred = logits.argmax(axis=-1)
+
+            preds.append(y_pred)
+            labels.append(y_true)
+
+    preds = np.concatenate(preds)
+    labels = np.concatenate(labels)
+    acc = (preds == labels).mean()
+    return acc
+
+try:
+    trained_model = trainer.model
+except NameError:
+    raise RuntimeError("Trainer (and its model) is not defined. Run B4 and B5 first.")
+
+accuracy = eval_subset(trained_model, test_tok, n=200)
+print(f"Accuracy on 200-sample subset: {accuracy:.4f}")
